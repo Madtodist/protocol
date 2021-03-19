@@ -26,7 +26,7 @@ documentation. If you'd like to view these docs on github instead, check out the
 
 ## Security and Bug Bounty 🐛
 
-Please see [here](./documentation/developer_reference/bug_bounty.md) for details on our bug bounty.
+Please see [here](https://docs.umaproject.org/dev-ref/bug-bounty) for details on our bug bounty.
 
 ## Contributing 🙌
 
@@ -39,7 +39,7 @@ For detailed information on how to initialize and interact with our smart contra
 
 ### Install dependencies 👷‍♂️
 
-You'll need the latest LTS release of nodejs and yarn installed. Assuming that's done, run `yarn` with no args:
+You'll need to install the long-term support version of nodejs, currently nodejs v14. You will also need to install yarn. Assuming that's done, run `yarn` with no args:
 
 ```
 yarn
@@ -244,7 +244,7 @@ See [STYLE.md](STYLE.md).
 ## Roadmap for the DVM 🛣
 
 Version 1 of the UMA Token and DVM have been released and launched. You can find the addresses of relevant contracts
-[here](./core/networks/1.json). This version implements most of what's described in the
+[here](./packages/core/networks/1.json). This version implements most of what's described in the
 [whitepaper](https://github.com/UMAprotocol/whitepaper/blob/master/UMA-DVM-oracle-whitepaper.pdf). Notable exceptions
 include:
 

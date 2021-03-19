@@ -1,66 +1,34 @@
-/* eslint-disable no-unused-vars */
 const { Balances, History, SharedAttributions } = require("./models");
 const assert = require("assert");
-const { decodeAttribution } = require("./contracts");
+const { DecodeAttribution, isAddress, toChecksumAddress } = require("./contracts");
 
-// keeps snapshots of all attributions to affiliates keyed by user
-function AttributionHistory() {
+// Requires empAbi and a defaultAddress to set un attributed tags to
+// Optionally include the attributions model, which is required to have a single function:
+// "attribute(userAddress,tagAddress,tokenAmount)". By default this will be a SharedAttributions model.
+function EmpAttributions(empAbi, defaultAddress, attributions) {
+  assert(empAbi, "requires empAbi");
+  assert(defaultAddress, "requires defaultAddress");
   // stores complete balances for all events
-  const attributions = SharedAttributions();
-  // stores snapshots we can lookup by block
-  const history = History();
-  let lastBlockNumber;
+  attributions = attributions || SharedAttributions();
+  const decoder = DecodeAttribution(empAbi);
 
-  // this probably needs to be re-thought to take into
-  // consideration token amounts as well as collateral
-  const Handlers = ({ affiliate, user }) => {
-    return {
-      create(collateralAmount, numTokens) {
-        attributions.attribute(user, affiliate, collateralAmount);
-      },
-      deposit(collateralAmount) {
-        attributions.attribute(user, affiliate, collateralAmount);
-      },
-      depositTo(sponsor, collateralAmount) {
-        attributions.attribute(user, affiliate, collateralAmount);
-      },
-      transferPositionPassedRequest(newSponsorAddress) {
-        attributions.attribute(newSponsorAddress, affiliate);
-      }
-    };
-  };
-
-  function handleEvent({ user, affiliate }, { name, args = [] }) {
-    assert(affiliate, "requires affiliate address");
-    assert(user, "requires user address");
-    const handlers = Handlers({ user, affiliate });
-    assert(handlers[name], "No handler for event: " + name);
-    return handlers[name](...args);
-  }
-
-  // event is a decoded transaction
-  function handleTransaction(blockNumber, event) {
-    assert(blockNumber, "requires blockNumber");
-    if (lastBlockNumber == null) {
-      lastBlockNumber = blockNumber;
-    } else if (lastBlockNumber < blockNumber) {
-      history.insert({
-        blockNumber: lastBlockNumber,
-        attributions: attributions.snapshot()
-      });
-      lastBlockNumber = blockNumber;
-    }
-    // both of these things arent stored in tx data
-    const affiliate = decodeAttribution(event.input);
-    const user = event.fromAddress;
-    handleEvent({ user, affiliate }, event);
+  function handleTransaction(transaction) {
+    assert(transaction.name == "create", "Can only handle emp create transactions");
+    // decoder may return nothing, garbage data, or a hex address without the 0x prepended
+    const tag = "0x" + decoder(transaction);
+    let attributionAddress = defaultAddress;
+    // validate the tag is an address, otherwise fallback to default address
+    // currently we will only accept valid addresses as a tag, this may change in future.
+    // Tagged addresses unfortunately always come in lower cased. We cast it to a checksum address if valid.
+    if (isAddress(tag)) attributionAddress = toChecksumAddress(tag);
+    const user = transaction.from_address;
+    const [, tokenAmount] = transaction.args;
+    attributions.attribute(user, attributionAddress, tokenAmount.toString());
   }
 
   return {
-    attributions,
-    history,
-    handleEvent,
-    handleTransaction
+    handleTransaction,
+    attributions
   };
 }
 
@@ -83,7 +51,8 @@ function EmpBalancesHistory() {
         blockNumber: lastBlockNumber,
         blockTimestamp: event.blockTimestamp,
         tokens: balances.tokens.snapshot(),
-        collateral: balances.collateral.snapshot()
+        collateral: balances.collateral.snapshot(),
+        isExpired: balances.isExpired()
       });
       lastBlockNumber = blockNumber;
       lastBlockTimestamp = event.blockTimestamp;
@@ -93,12 +62,16 @@ function EmpBalancesHistory() {
 
   // function to snapshot the final balance
   function finalize() {
+    // No balance history was updated. returning without error.
+    if (lastBlockNumber === undefined) return;
+    // history happened to end on last block number, nothing else needed.
     if (history.has(lastBlockNumber)) return;
     history.insert({
       blockNumber: lastBlockNumber,
       blockTimestamp: lastBlockTimestamp,
       tokens: balances.tokens.snapshot(),
-      collateral: balances.collateral.snapshot()
+      collateral: balances.collateral.snapshot(),
+      isExpired: balances.isExpired()
     });
   }
 
@@ -117,8 +90,14 @@ function EmpBalances(handlers = {}, { collateral, tokens } = {}) {
   collateral = collateral || Balances({ allowNegative: true });
   tokens = tokens || Balances({ allowNegative: true });
 
+  // Doesnt quite fit under umbrella of "balances" but this is the easiest place to set an expired flag.
+  let expired = false;
+  function isExpired() {
+    return expired;
+  }
+
   handlers = {
-    RequestTransferPosition(oldSponsor) {
+    RequestTransferPosition(/* oldSponsor*/) {
       // nothing
     },
     RequestTransferPositionExecuted(oldSponsor, newSponsor) {
@@ -130,7 +109,7 @@ function EmpBalances(handlers = {}, { collateral, tokens } = {}) {
       tokens.set(oldSponsor, "0");
       tokens.set(newSponsor, tokenBalance.toString());
     },
-    RequestTransferPositionCanceled(oldSponsor) {
+    RequestTransferPositionCanceled(/* oldSponsor*/) {
       // nothing
     },
     Deposit(sponsor, collateralAmount) {
@@ -139,34 +118,35 @@ function EmpBalances(handlers = {}, { collateral, tokens } = {}) {
     Withdrawal(sponsor, collateralAmount) {
       collateral.sub(sponsor, collateralAmount.toString());
     },
-    RequestWithdrawal(sponsor, collateralAmount) {
+    RequestWithdrawal(/* sponsor, collateralAmount*/) {
       // nothing
     },
     RequestWithdrawalExecuted(sponsor, collateralAmount) {
       collateral.sub(sponsor, collateralAmount.toString());
     },
-    RequestWithdrawalCanceled(sponsor, collateralAmount) {
+    RequestWithdrawalCanceled(/* sponsor, collateralAmount*/) {
       // nothing
     },
     PositionCreated(sponsor, collateralAmount, tokenAmount) {
       collateral.add(sponsor, collateralAmount.toString());
       tokens.add(sponsor, tokenAmount.toString());
     },
-    NewSponsor(sponsor) {
+    NewSponsor(/* sponsor*/) {
       // nothing
     },
-    EndedSponsorPosition(sponsor) {
+    EndedSponsorPosition(/* sponsor*/) {
       // nothing
     },
     Redeem(sponsor, collateralAmount, tokenAmount) {
       collateral.sub(sponsor, collateralAmount.toString());
       tokens.sub(sponsor, tokenAmount).toString();
     },
-    ContractExpired(caller) {
+    ContractExpired(/* caller*/) {
+      expired = true;
       // nothing
     },
     // looking at the emp code, i think anyone can call this even if they never had a position
-    // this means balances may not exist or may go below 0. we should just catch those errors and ignore
+    // this means balances may not exist or may go below 0. We allow balances to go negative.
     SettleExpiredPosition(caller, collateralReturned, tokensBurned) {
       collateral.sub(caller, collateralReturned.toString());
       tokens.sub(caller, tokensBurned.toString());
@@ -177,16 +157,19 @@ function EmpBalances(handlers = {}, { collateral, tokens } = {}) {
       liquidationId,
       tokensOutstanding,
       lockedCollateral,
-      liquidatedCollateral,
-      liquidationTime
+      liquidatedCollateral
+      // liquidationTime
     ) {
       collateral.sub(sponsor, liquidatedCollateral.toString());
       tokens.sub(sponsor, tokensOutstanding.toString());
     },
-    LiquidationWithdrawn(caller, originalExpirationTimestamp, shutdownTimestamp) {
+    LiquidationWithdrawn(/* caller, originalExpirationTimestamp, shutdownTimestamp*/) {
       // nothing
     },
-    LiquidationDisputed(caller, originalExpirationTimestamp, shutdownTimestamp) {
+    LiquidationDisputed(/* caller, originalExpirationTimestamp, shutdownTimestamp*/) {
+      // nothing
+    },
+    DisputeSettled() {
       // nothing
     },
     FinalFeesPaid() {
@@ -205,23 +188,16 @@ function EmpBalances(handlers = {}, { collateral, tokens } = {}) {
     }
   }
 
-  function getCollateral() {
-    return collateral;
-  }
-  function getTokens() {
-    return tokens;
-  }
   return {
     handleEvent,
     collateral,
-    tokens
+    tokens,
+    isExpired
   };
 }
 
 module.exports = {
   EmpBalances,
   EmpBalancesHistory,
-  AttributionHistory
+  EmpAttributions
 };
-
-/* eslint-enable no-unused-vars */

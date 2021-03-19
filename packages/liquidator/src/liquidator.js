@@ -12,55 +12,51 @@ class Liquidator {
   /**
    * @notice Constructs new Liquidator bot.
    * @param {Object} logger Module used to send logs.
-   * @param {Object} expiringMultiPartyClient Module used to query EMP information on-chain.
+   * @param {Object} financialContractClient Module used to query Financial Contract information on-chain.
    * @param {Object} gasEstimator Module used to estimate optimal gas price with which to send txns.
-   * @param {Object} votingContract DVM to query price requests.
    * @param {Object} syntheticToken Synthetic token (tokenCurrency).
    * @param {Object} priceFeed Module used to query the current token price.
    * @param {String} account Ethereum account from which to send txns.
-   * @param {Object} [config] Contains fields with which constructor will attempt to override defaults.
-   * @param {Object} empProps Contains EMP contract state data. Expected:
+   * @param {Object} financialContractProps Contains Financial Contract contract state data. Expected:
    *      { crRatio: 1.5e18,
             minSponsorSize: 10e18,
             priceIdentifier: hex("ETH/BTC") }
-   * @param {Object} [config] Contains fields with which constructor will attempt to override defaults.
+   * @param {Object} [liquidatorConfig] Contains fields with which constructor will attempt to override defaults.
    */
   constructor({
     logger,
-    expiringMultiPartyClient,
+    financialContractClient,
     gasEstimator,
-    votingContract,
     syntheticToken,
     priceFeed,
     account,
-    empProps,
-    config
+    financialContractProps,
+    liquidatorConfig
   }) {
     this.logger = logger;
     this.account = account;
 
     // Expiring multiparty contract to read contract state
-    this.empClient = expiringMultiPartyClient;
-    this.web3 = this.empClient.web3;
+    this.financialContractClient = financialContractClient;
+    this.web3 = this.financialContractClient.web3;
 
     // Gas Estimator to calculate the current Fast gas rate.
     this.gasEstimator = gasEstimator;
 
     // Instance of the expiring multiparty to perform on-chain liquidations.
-    this.empContract = this.empClient.emp;
-    this.votingContract = votingContract;
+    this.financialContract = this.financialContractClient.financialContract;
     this.syntheticToken = syntheticToken;
 
     // Instance of the price feed to get the realtime token price.
     this.priceFeed = priceFeed;
 
-    // The EMP contract collateralization Ratio is needed to calculate minCollateralPerToken.
-    this.empCRRatio = empProps.crRatio;
+    // The Financial Contract contract collateralization Ratio is needed to calculate minCollateralPerToken.
+    this.financialContractCRRatio = financialContractProps.crRatio;
 
-    // The EMP contract min sponsor position size is needed to calculate maxTokensToLiquidate.
-    this.empMinSponsorSize = empProps.minSponsorSize;
+    // The Financial Contract contract min sponsor position size is needed to calculate maxTokensToLiquidate.
+    this.financialContractMinSponsorSize = financialContractProps.minSponsorSize;
 
-    this.empIdentifier = empProps.priceIdentifier;
+    this.financialContractIdentifier = financialContractProps.priceIdentifier;
 
     // Helper functions from web3.
     this.BN = this.web3.utils.BN;
@@ -73,7 +69,7 @@ class Liquidator {
     this.GAS_LIMIT_BUFFER = 1.25;
 
     // Default config settings. Liquidator deployer can override these settings by passing in new
-    // values via the `config` input object. The `isValid` property is a function that should be called
+    // values via the `liquidatorConfig` input object. The `isValid` property is a function that should be called
     // before resetting any config settings. `isValid` must return a Boolean.
     const defaultConfig = {
       crThreshold: {
@@ -88,7 +84,7 @@ class Liquidator {
       },
       liquidationDeadline: {
         // `liquidationDeadline`: Aborts the liquidation if the transaction is mined this amount of time after the
-        // EMP client's last update time. Denominated in seconds, so 300 = 5 minutes.
+        // Financial Contract client's last update time. Denominated in seconds, so 300 = 5 minutes.
         value: 300,
         isValid: x => {
           return x >= 0;
@@ -121,33 +117,57 @@ class Liquidator {
           return Object.values(overrides).every(param => Object.keys(this.logger.levels).includes(param));
         }
       },
-      whaleDefenseFundWei: {
-        // by default make this disabled
-        value: undefined,
-        isValid: x => {
-          if (x === undefined) return true;
-          return this.toBN(x).gte(this.toBN("0"));
-        }
-      },
       defenseActivationPercent: {
         value: undefined,
         isValid: x => {
           if (x === undefined) return true;
           return parseFloat(x) >= 0 && parseFloat(x) <= 100;
         }
+      },
+      contractType: {
+        value: undefined,
+        isValid: x => {
+          return x === "ExpiringMultiParty" || x === "Perpetual";
+        }
+      },
+      contractVersion: {
+        value: undefined,
+        isValid: x => {
+          return x === "1.2.0" || x === "1.2.1" || x === "1.2.2" || x === "latest";
+        }
+      },
+      // Start and end block define a window used to filter for contract events.
+      startingBlock: {
+        value: undefined,
+        isValid: x => {
+          if (x === undefined) return true;
+          return Number(x) >= 0;
+        }
+      },
+      endingBlock: {
+        value: undefined,
+        isValid: x => {
+          if (x === undefined) return true;
+          return Number(x) >= 0;
+        }
       }
     };
 
     // Validate and set config settings to class state.
-    const configWithDefaults = createObjectFromDefaultProps(config, defaultConfig);
+    const configWithDefaults = createObjectFromDefaultProps(liquidatorConfig, defaultConfig);
     Object.assign(this, configWithDefaults);
+
+    // These EMP versions have different "LiquidationWithdrawn" event parameters that we need to handle.
+    this.isLegacyEmpVersion = Boolean(
+      this.contractVersion === "1.2.0" || this.contractVersion === "1.2.1" || this.contractVersion === "1.2.2"
+    );
 
     // generalize log emitter, use it to attach default data to all logs
     const log = (severity = "info", data = {}) => {
       // would rather just throw here and let index.js capture and log, but
       // its currently not set up to add in the additional context for the error
       // so it has to be done here.
-      if (logger[severity] == null) {
+      if (logger[severity] === null) {
         return logger.error({
           at: "Liquidator",
           ...data,
@@ -157,7 +177,7 @@ class Liquidator {
       return logger[severity]({
         at: "Liquidator",
         // could add in additional context for any error thrown,
-        // such as state of emp or bot configuration data
+        // such as state of financialContract or bot configuration data
         minLiquidationPrice: this.liquidationMinPrice,
         ...data
       });
@@ -168,16 +188,16 @@ class Liquidator {
     this.liquidationStrategy = LiquidationStrategy(
       {
         ...configWithDefaults,
-        ...empProps
+        ...financialContractProps
       },
       this.web3.utils,
       log
     );
   }
 
-  // Update the empClient, gasEstimator and price feed. If a client has recently updated then it will do nothing.
+  // Update the financialContractClient, gasEstimator and price feed. If a client has recently updated then it will do nothing.
   async update() {
-    await Promise.all([this.empClient.update(), this.gasEstimator.update(), this.priceFeed.update()]);
+    await Promise.all([this.financialContractClient.update(), this.gasEstimator.update(), this.priceFeed.update()]);
   }
   // Queries underCollateralized positions and performs liquidations against any under collateralized positions.
   // If `maxTokensToLiquidateWei` is not passed in, then the bot will attempt to liquidate the full position.
@@ -209,22 +229,24 @@ class Liquidator {
     // checks for a positions correct capitalization, not collateralization. In order to liquidate a position that is
     // under collaterelaized (but over capitalized) The CR ratio needs to be included in the maxCollateralPerToken.
     const maxCollateralPerToken = this.toBN(scaledPrice)
-      .mul(this.toBN(this.empCRRatio))
-      .div(this.toBN(this.toWei("1")));
+      .mul(this.toBN(this.financialContractCRRatio))
+      .mul(this.financialContractClient.getLatestCumulativeFundingRateMultiplier())
+      .div(this.toBN(this.toWei("1")).mul(this.toBN(this.toWei("1"))));
 
     this.logger.debug({
       at: "Liquidator",
       message: "Checking for under collateralized positions",
       liquidatorOverridePrice: liquidatorOverridePrice ? liquidatorOverridePrice.toString() : null,
+      latestCumulativeFundingRateMultiplier: this.financialContractClient.getLatestCumulativeFundingRateMultiplier(),
       inputPrice: price.toString(),
       scaledPrice: scaledPrice.toString(),
-      empCRRatio: this.empCRRatio.toString(),
+      financialContractCRRatio: this.financialContractCRRatio.toString(),
       maxCollateralPerToken: maxCollateralPerToken.toString(),
       crThreshold: this.crThreshold
     });
 
     // Get the latest undercollateralized positions from the client.
-    const underCollateralizedPositions = this.empClient.getUnderCollateralizedPositions(scaledPrice);
+    const underCollateralizedPositions = this.financialContractClient.getUnderCollateralizedPositions(scaledPrice);
 
     if (underCollateralizedPositions.length === 0) {
       this.logger.debug({
@@ -239,11 +261,12 @@ class Liquidator {
         at: "Liquidator",
         message: "Detected a liquidatable position",
         scaledPrice: scaledPrice.toString(),
-        position: JSON.stringify(position)
+        maxCollateralPerToken: maxCollateralPerToken.toString(),
+        position: position
       });
 
       // Note: query the time again during each iteration to ensure the deadline is set reasonably.
-      const currentBlockTime = this.empClient.getLastUpdateTime();
+      const currentBlockTime = this.financialContractClient.getLastUpdateTime();
       const syntheticTokenBalance = this.toBN(await this.syntheticToken.methods.balanceOf(this.account).call());
 
       // run strategy based on configs and current state
@@ -254,37 +277,18 @@ class Liquidator {
         position,
         // need to know our current balance to know how much to save for defense fund
         syntheticTokenBalance,
+        currentBlockTime,
         // this is required to create liquidation object
         maxCollateralPerToken,
         // maximum tokens we can liquidate in position
         maxTokensToLiquidateWei,
-        // minimim position size, as well as minimum liquidation to extend withdraw
-        empMinSponsorSize: this.empMinSponsorSize,
-        currentBlockTime,
         // for logging
         inputPrice: scaledPrice.toString()
       });
 
-      // we couldnt liquidate, this typically would only happen if our balance is 0
-      // This gets logged as an event, see constructor
-      if (!liquidationArgs) {
-        // the bot cannot liquidate the full position size, but the full position size is at the minimum sponsor threshold. Therefore, the
-        // bot can liquidate 0 tokens. The smart contracts should disallow this, but a/o June 2020 this behavior is allowed so we should block it
-        // client-side.
-        this.logger.error({
-          at: "Liquidator",
-          message: "Position size is equal to the minimum: not enough synthetic to initiate full liquidation✋",
-          sponsor: position.sponsor,
-          inputPrice: scaledPrice.toString(),
-          position: position,
-          minLiquidationPrice: this.liquidationMinPrice,
-          maxLiquidationPrice: maxCollateralPerToken.toString(),
-          tokensToLiquidate: "0",
-          syntheticTokenBalance: syntheticTokenBalance.toString(),
-          error: new Error("Refusing to liquidate 0 tokens")
-        });
-        continue;
-      }
+      // we couldnt liquidate, this typically would only happen if our balance is 0 or the withdrawal liveness
+      // has not passed the WDF's activation threshold.
+      if (!liquidationArgs) continue;
 
       // pulls the tokens to liquidate parameter out of the liquidation arguments
       const tokensToLiquidate = this.toBN(liquidationArgs[3].rawValue);
@@ -306,7 +310,7 @@ class Liquidator {
       }
 
       // liquidation strategy will control how much to liquidate
-      const liquidation = this.empContract.methods.createLiquidation(...liquidationArgs);
+      const liquidation = this.financialContract.methods.createLiquidation(...liquidationArgs);
 
       // Send the transaction or report failure.
       let receipt;
@@ -389,8 +393,8 @@ class Liquidator {
 
     // All of the liquidations that we could withdraw rewards from are drawn from the pool of
     // expired and disputed liquidations.
-    const expiredLiquidations = this.empClient.getExpiredLiquidations();
-    const disputedLiquidations = this.empClient.getDisputedLiquidations();
+    const expiredLiquidations = this.financialContractClient.getExpiredLiquidations();
+    const disputedLiquidations = this.financialContractClient.getDisputedLiquidations();
     const potentialWithdrawableLiquidations = expiredLiquidations
       .concat(disputedLiquidations)
       .filter(liquidation => liquidation.liquidator === this.account);
@@ -407,22 +411,22 @@ class Liquidator {
       this.logger.debug({
         at: "Liquidator",
         message: "Detected a pending or expired liquidation",
-        liquidation: JSON.stringify(liquidation)
+        liquidation: liquidation
       });
 
       // Construct transaction.
-      const withdraw = this.empContract.methods.withdrawLiquidation(liquidation.id, liquidation.sponsor);
+      const withdraw = this.financialContract.methods.withdrawLiquidation(liquidation.id, liquidation.sponsor);
 
       // Confirm that liquidation has eligible rewards to be withdrawn.
-      let withdrawAmount, gasEstimation;
+      let withdrawalCallResponse, gasEstimation;
       try {
-        [withdrawAmount, gasEstimation] = await Promise.all([
+        [withdrawalCallResponse, gasEstimation] = await Promise.all([
           withdraw.call({ from: this.account }),
           withdraw.estimateGas({ from: this.account })
         ]);
         // Mainnet view/pure functions sometimes don't revert, even if a require is not met. The revertWrapper ensures this
         // caught correctly. see https://forum.openzeppelin.com/t/require-in-view-pure-functions-dont-revert-on-public-networks/1211
-        if (revertWrapper(withdrawAmount) === null) {
+        if (revertWrapper(withdrawalCallResponse) === null) {
           throw new Error("Simulated reward withdrawal failed");
         }
       } catch (error) {
@@ -435,23 +439,26 @@ class Liquidator {
         continue;
       }
 
+      // In contract version 1.2.2 and below this function returns one value: the amount withdrawn by the function caller.
+      // In later versions it returns an object containing all payouts.
+      const amountWithdrawn = this.isLegacyEmpVersion
+        ? withdrawalCallResponse.rawValue.toString()
+        : withdrawalCallResponse.payToLiquidator.rawValue.toString();
+
       const txnConfig = {
         from: this.account,
         gas: Math.min(Math.floor(gasEstimation * this.GAS_LIMIT_BUFFER), this.txnGasLimit),
         gasPrice: this.gasEstimator.getCurrentFastPrice()
       };
+      // In contract version 1.2.2 and below this function returns one value: the amount withdrawn by the function caller.
+      // In later versions it returns an object containing all payouts.
       this.logger.debug({
         at: "Liquidator",
         message: "Withdrawing liquidation",
         liquidation: liquidation,
-        amount: withdrawAmount.rawValue.toString(),
+        amountWithdrawn,
         txnConfig
       });
-
-      // Before submitting transaction, store liquidation timestamp before it is potentially deleted if this is the final reward to be withdrawn.
-      // We can be confident that `liquidationTime` property is available and accurate because the liquidation has not been deleted yet if we `withdrawLiquidation()`
-      // is callable.
-      let requestTimestamp = liquidation.liquidationTime;
 
       // Send the transaction or report failure.
       let receipt;
@@ -482,42 +489,31 @@ class Liquidator {
         continue;
       }
 
-      // Get resolved price request for dispute. This will fail if there is no price for the liquidation timestamp, which is possible if the
-      // liquidation expired without dispute.
-      let resolvedPrice;
-      if (requestTimestamp) {
-        try {
-          resolvedPrice = revertWrapper(
-            await this.votingContract.methods.getPrice(this.empIdentifier, requestTimestamp).call({
-              from: this.empContract.options.address
-            })
-          );
-        } catch (error) {
-          // Ignore any errors as this indicates that there is nothing to do yet.
-        }
-      }
-
-      const logResult = {
+      let logResult = {
         tx: receipt.transactionHash,
         caller: receipt.events.LiquidationWithdrawn.returnValues.caller,
-        withdrawalAmount: receipt.events.LiquidationWithdrawn.returnValues.withdrawalAmount,
+        // Settlement price is possible undefined if liquidation expired without a dispute
+        settlementPrice: receipt.events.LiquidationWithdrawn.returnValues.settlementPrice,
         liquidationStatus:
           PostWithdrawLiquidationRewardsStatusTranslations[
             receipt.events.LiquidationWithdrawn.returnValues.liquidationStatus
           ]
       };
 
-      // If there is no price available for the withdrawable liquidation, likely that liquidation expired without dispute.
-      if (resolvedPrice) {
-        logResult.resolvedPrice = resolvedPrice.toString();
+      // In contract version 1.2.2 and below this event returns one value, `withdrawalAmount`: the amount withdrawn by the function caller.
+      // In later versions it returns an object containing all payouts.
+      if (this.isLegacyEmpVersion) {
+        logResult.withdrawalAmount = receipt.events.LiquidationWithdrawn.returnValues.withdrawalAmount;
+      } else {
+        logResult.paidToLiquidator = receipt.events.LiquidationWithdrawn.returnValues.paidToLiquidator;
+        logResult.paidToDisputer = receipt.events.LiquidationWithdrawn.returnValues.paidToDisputer;
+        logResult.paidToSponsor = receipt.events.LiquidationWithdrawn.returnValues.paidToSponsor;
       }
 
       this.logger.info({
         at: "Liquidator",
         message: "Liquidation withdrawn🤑",
         liquidation: liquidation,
-        amount: withdrawAmount.rawValue.toString(),
-        txnConfig,
         liquidationResult: logResult
       });
     }

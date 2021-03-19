@@ -1,5 +1,5 @@
 const { PriceFeedInterface } = require("./PriceFeedInterface");
-const { parseFixed } = require("@ethersproject/bignumber");
+const { parseFixed } = require("@uma/common");
 
 // An implementation of PriceFeedInterface that uses CryptoWatch to retrieve prices.
 class CryptoWatchPriceFeed extends PriceFeedInterface {
@@ -18,7 +18,7 @@ class CryptoWatchPriceFeed extends PriceFeedInterface {
    * @param {Integer} minTimeBetweenUpdates Min number of seconds between updates. If update() is called again before
    *      this number of seconds has passed, it will be a no-op.
    * @param {Bool} invertPrice Indicates if prices should be inverted before returned.
-   * @param {Number} decimals Number of decimals to use to convert price to wei.
+   * @param {Number} priceFeedDecimals Number of priceFeedDecimals to use to convert price to wei.
    * @param {Number} ohlcPeriod Number of seconds interval between ohlc prices requested from cryptowatch.
    */
   constructor(
@@ -32,7 +32,7 @@ class CryptoWatchPriceFeed extends PriceFeedInterface {
     getTime,
     minTimeBetweenUpdates,
     invertPrice,
-    decimals = 18,
+    priceFeedDecimals = 18,
     ohlcPeriod = 60 // One minute is CryptoWatch's most granular option.
   ) {
     super();
@@ -43,19 +43,22 @@ class CryptoWatchPriceFeed extends PriceFeedInterface {
     this.exchange = exchange;
     this.pair = pair;
     this.lookback = lookback;
+    this.uuid = `CryptoWatch-${exchange}-${pair}`;
     this.networker = networker;
     this.getTime = getTime;
     this.minTimeBetweenUpdates = minTimeBetweenUpdates;
+    this.priceFeedDecimals = priceFeedDecimals;
     this.invertPrice = invertPrice;
 
     this.toBN = this.web3.utils.toBN;
 
     this.ohlcPeriod = ohlcPeriod;
 
-    this.convertDecimals = number => {
+    this.convertPriceFeedDecimals = number => {
       // Converts price result to wei
-      // returns price conversion to correct decimals as a big number
-      return this.toBN(parseFixed(number.toString(), decimals).toString());
+      // returns price conversion to correct decimals as a big number.
+      // Note: Must ensure that `number` has no more decimal places than `priceFeedDecimals`.
+      return this.toBN(parseFixed(number.toString().substring(0, priceFeedDecimals), priceFeedDecimals).toString());
     };
   }
 
@@ -63,9 +66,9 @@ class CryptoWatchPriceFeed extends PriceFeedInterface {
     return this.invertPrice ? this._invertPriceSafely(this.currentPrice) : this.currentPrice;
   }
 
-  getHistoricalPrice(time, verbose = false) {
+  async getHistoricalPrice(time, verbose = false) {
     if (this.lastUpdateTime === undefined) {
-      return undefined;
+      throw new Error(`${this.uuid}: undefined lastUpdateTime`);
     }
 
     // Set first price period in `historicalPricePeriods` to first non-null price.
@@ -79,13 +82,13 @@ class CryptoWatchPriceFeed extends PriceFeedInterface {
 
     // If there are no valid price periods, return null.
     if (!firstPricePeriod) {
-      return null;
+      throw new Error(`${this.uuid}: no valid price periods`);
     }
 
     // If the time is before the first piece of data in the set, return null because
     // the price is before the lookback window.
     if (time < firstPricePeriod.openTime) {
-      return null;
+      throw new Error(`${this.uuid}: time ${time} is before firstPricePeriod.openTime`);
     }
 
     // historicalPricePeriods are ordered from oldest to newest.
@@ -96,8 +99,9 @@ class CryptoWatchPriceFeed extends PriceFeedInterface {
 
     // If there is no match, that means that the time was past the last data point.
     // In this case, the best match for this price is the current price.
+    let returnPrice;
     if (match === undefined) {
-      let returnPrice = this.invertPrice ? this._invertPriceSafely(this.currentPrice) : this.currentPrice;
+      returnPrice = this.invertPrice ? this._invertPriceSafely(this.currentPrice) : this.currentPrice;
       if (verbose) {
         console.group(`\n(${this.exchange}:${this.pair}) No OHLC available @ ${time}`);
         console.log(
@@ -110,10 +114,10 @@ class CryptoWatchPriceFeed extends PriceFeedInterface {
         );
         console.groupEnd();
       }
-      return this.invertPrice ? this._invertPriceSafely(this.currentPrice) : this.currentPrice;
+      return returnPrice;
     }
 
-    let returnPrice = this.invertPrice ? this._invertPriceSafely(match.openPrice) : match.openPrice;
+    returnPrice = this.invertPrice ? this._invertPriceSafely(match.openPrice) : match.openPrice;
     if (verbose) {
       console.group(`\n(${this.exchange}:${this.pair}) Historical OHLC @ ${match.closeTime}`);
       console.log(`- ✅ Open Price:${this.web3.utils.fromWei(returnPrice.toString())}`);
@@ -132,19 +136,25 @@ class CryptoWatchPriceFeed extends PriceFeedInterface {
   }
 
   getHistoricalPricePeriods() {
-    if (!this.invertPrice) return this.historicalPricePeriods;
+    if (!this.invertPrice)
+      return this.historicalPricePeriods.map(historicalPrice => {
+        return [historicalPrice.closeTime, historicalPrice.closePrice];
+      });
     else
       return this.historicalPricePeriods.map(historicalPrice => {
-        return {
-          ...historicalPrice,
-          openPrice: this._invertPriceSafely(historicalPrice.openPrice),
-          closePrice: this._invertPriceSafely(historicalPrice.closePrice)
-        };
+        return [historicalPrice.closeTime, this._invertPriceSafely(historicalPrice.closePrice)];
       });
   }
-
   getLastUpdateTime() {
     return this.lastUpdateTime;
+  }
+
+  getLookback() {
+    return this.lookback;
+  }
+
+  getPriceFeedDecimals() {
+    return this.priceFeedDecimals;
   }
 
   async update() {
@@ -164,7 +174,7 @@ class CryptoWatchPriceFeed extends PriceFeedInterface {
 
     this.logger.debug({
       at: "CryptoWatchPriceFeed",
-      message: "Updating",
+      message: "Updating CryptoWatchPriceFeed",
       currentTime: currentTime,
       lastUpdateTimestamp: this.lastUpdateTime
     });
@@ -210,7 +220,7 @@ class CryptoWatchPriceFeed extends PriceFeedInterface {
     //     "price": priceValue
     //   }
     // }
-    const newPrice = this.convertDecimals(priceResponse.result.price);
+    const newPrice = this.convertPriceFeedDecimals(priceResponse.result.price);
 
     // Return data structure:
     // {
@@ -235,8 +245,8 @@ class CryptoWatchPriceFeed extends PriceFeedInterface {
         // Output data should be a list of objects with only the open and close times and prices.
         openTime: ohlc[0] - this.ohlcPeriod,
         closeTime: ohlc[0],
-        openPrice: this.convertDecimals(ohlc[1]),
-        closePrice: this.convertDecimals(ohlc[4])
+        openPrice: this.convertPriceFeedDecimals(ohlc[1]),
+        closePrice: this.convertPriceFeedDecimals(ohlc[4])
       }))
       .sort((a, b) => {
         // Sorts the data such that the oldest elements come first.
@@ -251,8 +261,8 @@ class CryptoWatchPriceFeed extends PriceFeedInterface {
 
   _invertPriceSafely(priceBN) {
     if (priceBN && !priceBN.isZero()) {
-      return this.convertDecimals("1")
-        .mul(this.convertDecimals("1"))
+      return this.convertPriceFeedDecimals("1")
+        .mul(this.convertPriceFeedDecimals("1"))
         .div(priceBN);
     } else {
       return undefined;

@@ -92,7 +92,9 @@ contract OptimisticOracle is OptimisticOracleInterface, Testable, Lockable {
         bytes32 identifier,
         uint256 timestamp,
         bytes ancillaryData,
-        int256 proposedPrice
+        int256 proposedPrice,
+        uint256 expirationTimestamp,
+        address currency
     );
     event DisputePrice(
         address indexed requester,
@@ -100,7 +102,8 @@ contract OptimisticOracle is OptimisticOracleInterface, Testable, Lockable {
         address indexed disputer,
         bytes32 identifier,
         uint256 timestamp,
-        bytes ancillaryData
+        bytes ancillaryData,
+        int256 proposedPrice
     );
     event Settle(
         address indexed requester,
@@ -292,8 +295,16 @@ contract OptimisticOracle is OptimisticOracleInterface, Testable, Lockable {
             request.currency.safeTransferFrom(msg.sender, address(this), totalBond);
         }
 
-        // Event.
-        emit ProposePrice(requester, proposer, identifier, timestamp, ancillaryData, proposedPrice);
+        emit ProposePrice(
+            requester,
+            proposer,
+            identifier,
+            timestamp,
+            ancillaryData,
+            proposedPrice,
+            request.expirationTime,
+            address(request.currency)
+        );
 
         // Callback.
         if (address(requester).isContract())
@@ -355,16 +366,21 @@ contract OptimisticOracle is OptimisticOracleInterface, Testable, Lockable {
         }
 
         StoreInterface store = _getStore();
-        if (finalFee > 0) {
+
+        // Avoids stack too deep compilation error.
+        {
             // Along with the final fee, "burn" part of the loser's bond to ensure that a larger bond always makes it
             // proportionally more expensive to delay the resolution even if the proposer and disputer are the same
             // party.
             uint256 burnedBond = _computeBurnedBond(request);
 
-            // Pay the final fee and the burned bond to the store.
+            // The total fee is the burned bond and the final fee added together.
             uint256 totalFee = finalFee.add(burnedBond);
-            request.currency.safeIncreaseAllowance(address(store), totalFee);
-            _getStore().payOracleFeesErc20(address(request.currency), FixedPoint.Unsigned(totalFee));
+
+            if (totalFee > 0) {
+                request.currency.safeIncreaseAllowance(address(store), totalFee);
+                _getStore().payOracleFeesErc20(address(request.currency), FixedPoint.Unsigned(totalFee));
+            }
         }
 
         _getOracle().requestPrice(identifier, timestamp, _stampAncillaryData(ancillaryData, requester));
@@ -377,8 +393,15 @@ contract OptimisticOracle is OptimisticOracleInterface, Testable, Lockable {
             request.currency.safeTransfer(requester, refund);
         }
 
-        // Event.
-        emit DisputePrice(requester, request.proposer, disputer, identifier, timestamp, ancillaryData);
+        emit DisputePrice(
+            requester,
+            request.proposer,
+            disputer,
+            identifier,
+            timestamp,
+            ancillaryData,
+            request.proposedPrice
+        );
 
         // Callback.
         if (address(requester).isContract())
@@ -576,7 +599,6 @@ contract OptimisticOracle is OptimisticOracleInterface, Testable, Lockable {
             revert("_settle: not settleable");
         }
 
-        // Event.
         emit Settle(
             requester,
             request.proposer,

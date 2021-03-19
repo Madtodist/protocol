@@ -5,18 +5,20 @@ const retry = require("async-retry");
 
 // Clients to retrieve on-chain data and helpers.
 const {
-  ExpiringMultiPartyClient,
-  ExpiringMultiPartyEventClient,
+  FinancialContractClient,
+  FinancialContractEventClient,
+  OptimisticOracleEventClient,
   TokenBalanceClient,
   Networker,
   Logger,
-  createReferencePriceFeedForEmp,
-  createTokenPriceFeedForEmp,
+  createReferencePriceFeedForFinancialContract,
+  createTokenPriceFeedForFinancialContract,
   waitForLogger,
   delay
 } = require("@uma/financial-templates-lib");
 
 // Monitor modules to report on client state changes.
+const { OptimisticOracleContractMonitor } = require("./src/OptimisticOracleContractMonitor");
 const { ContractMonitor } = require("./src/ContractMonitor");
 const { BalanceMonitor } = require("./src/BalanceMonitor");
 const { CRMonitor } = require("./src/CRMonitor");
@@ -24,29 +26,32 @@ const { SyntheticPegMonitor } = require("./src/SyntheticPegMonitor");
 
 // Contract ABIs and network Addresses.
 const { getAbi, getAddress } = require("@uma/core");
-const { getWeb3 } = require("@uma/common");
+const { getWeb3, findContractVersion, SUPPORTED_CONTRACT_VERSIONS } = require("@uma/common");
 
 /**
  * @notice Continuously attempts to monitor contract positions and reports based on monitor modules.
  * @param {Object} logger Module responsible for sending logs.
- * @param {String} address Contract address of the EMP.
+ * @param {String} financialContractAddress Contract address of the Financial Contract.
+ * @param {String} optimisticOracleAddress Contract address of the OptimisticOracle Contract.
  * @param {Number} pollingDelay The amount of seconds to wait between iterations. If set to 0 then running in serverless
  *     mode which will exit after the loop.
  * @param {Number} errorRetries The number of times the execution loop will re-try before throwing if an error occurs.
  * @param {Number} errorRetriesTimeout The amount of milliseconds to wait between re-try iterations on failed loops.
  * @param {Number} startingBlock Offset block number to define where the monitor bot should start searching for events
- *     from. If 0 will look for all events back to deployment of the EMP. If set to null uses current block number.
+ *     from. If 0 will look for all events back to deployment of the Financial Contract. If set to null uses current block number.
  * @param {Number} endingBlock Termination block number to define where the monitor bot should end searching for events.
  *     If `null` then will search up until the latest block number in each loop.
  * @param {Object} monitorConfig Configuration object to parameterize all monitor modules.
  * @param {Object} tokenPriceFeedConfig Configuration to construct the tokenPriceFeed (balancer or uniswap) price feed object.
  * @param {Object} medianizerPriceFeedConfig Configuration to construct the reference price feed object.
+ * @param {Object} denominatorPriceFeedConfig Configuration to construct the denominator price feed object.
  * @return None or throws an Error.
  */
 async function run({
   logger,
   web3,
-  empAddress,
+  financialContractAddress,
+  optimisticOracleAddress,
   pollingDelay,
   errorRetries,
   errorRetriesTimeout,
@@ -54,7 +59,8 @@ async function run({
   endingBlock,
   monitorConfig,
   tokenPriceFeedConfig,
-  medianizerPriceFeedConfig
+  medianizerPriceFeedConfig,
+  denominatorPriceFeedConfig
 }) {
   try {
     const { hexToUtf8 } = web3.utils;
@@ -64,7 +70,8 @@ async function run({
     logger[pollingDelay === 0 ? "debug" : "info"]({
       at: "Monitor#index",
       message: "Monitor started 🕵️‍♂️",
-      empAddress,
+      financialContractAddress,
+      optimisticOracleAddress,
       pollingDelay,
       errorRetries,
       errorRetriesTimeout,
@@ -72,151 +79,287 @@ async function run({
       endingBlock,
       monitorConfig,
       tokenPriceFeedConfig,
-      medianizerPriceFeedConfig
+      medianizerPriceFeedConfig,
+      denominatorPriceFeedConfig
     });
 
     const getTime = () => Math.round(new Date().getTime() / 1000);
 
-    const networker = new Networker(logger);
+    /** *************************************
+     *
+     * Set variables common to all monitors
+     *
+     ***************************************/
+    const [networkId, latestBlock] = await Promise.all([web3.eth.net.getId(), web3.eth.getBlock("latest")]);
+    // If startingBlock is set to null then use the `latest` block number for the `eventsFromBlockNumber` and leave the
+    // `endingBlock` as null.
+    const eventsFromBlockNumber = startingBlock ? startingBlock : latestBlock.number;
+    if (!monitorConfig) monitorConfig = {};
 
-    // 0. Setup EMP and token instances to monitor.
-    const [networkId, latestBlock, medianizerPriceFeed, tokenPriceFeed] = await Promise.all([
-      web3.eth.net.getId(),
-      web3.eth.getBlock("latest"),
-      createReferencePriceFeedForEmp(logger, web3, networker, getTime, empAddress, medianizerPriceFeedConfig),
-      createTokenPriceFeedForEmp(logger, web3, networker, getTime, empAddress, tokenPriceFeedConfig)
-    ]);
+    // List of promises to run in parallel during each iteration, each of which represents a monitor executing.
+    let monitorRunners = [];
+    // At the beginning of each iteration, we'll need to repopulate the `monitorRunners` array with promises
+    // to run in parallel.
+    let populateMonitorRunnerHelpers = [];
 
-    if (!medianizerPriceFeed || !tokenPriceFeed) {
-      throw new Error("Price feed config is invalid");
+    /** *************************************
+     *
+     * Financial Contract Runner
+     *
+     ***************************************/
+    if (financialContractAddress) {
+      const [detectedContract] = await Promise.all([findContractVersion(financialContractAddress, web3)]);
+
+      // Append the contract version and type to the monitorConfig, if the monitorConfig does not already contain one.
+      if (!monitorConfig.contractVersion) monitorConfig.contractVersion = detectedContract.contractVersion;
+      if (!monitorConfig.contractType) monitorConfig.contractType = detectedContract.contractType;
+
+      // Check that the version and type is supported. Note if either is null this check will also catch it.
+      if (
+        SUPPORTED_CONTRACT_VERSIONS.filter(
+          vo => vo.contractType == monitorConfig.contractType && vo.contractVersion == monitorConfig.contractVersion
+        ).length == 0
+      )
+        throw new Error(
+          `Contract version specified or inferred is not supported by this bot. Monitor config:${JSON.stringify(
+            monitorConfig
+          )} & detectedContractVersion:${JSON.stringify(detectedContract)} is not part of ${JSON.stringify(
+            SUPPORTED_CONTRACT_VERSIONS
+          )}`
+        );
+
+      // Setup contract instances.
+      const voting = new web3.eth.Contract(getAbi("Voting", "1.2.2"), getAddress("Voting", networkId));
+      const financialContract = new web3.eth.Contract(
+        getAbi(monitorConfig.contractType, monitorConfig.contractVersion),
+        financialContractAddress
+      );
+      const networker = new Networker(logger);
+
+      // We want to enforce that all pricefeeds return prices in the same precision, so we'll construct one price feed
+      // initially and grab its precision to pass into the other price feeds:
+      const medianizerPriceFeed = await createReferencePriceFeedForFinancialContract(
+        logger,
+        web3,
+        networker,
+        getTime,
+        financialContractAddress,
+        medianizerPriceFeedConfig
+      );
+      const priceFeedDecimals = medianizerPriceFeed.getPriceFeedDecimals();
+
+      // 0. Setup Financial Contract and token instances to monitor.
+      const [tokenPriceFeed, denominatorPriceFeed] = await Promise.all([
+        createTokenPriceFeedForFinancialContract(logger, web3, networker, getTime, financialContractAddress, {
+          ...tokenPriceFeedConfig,
+          priceFeedDecimals
+        }),
+        denominatorPriceFeedConfig &&
+          createReferencePriceFeedForFinancialContract(logger, web3, networker, getTime, financialContractAddress, {
+            ...denominatorPriceFeedConfig,
+            priceFeedDecimals
+          })
+      ]);
+
+      // All of the pricefeeds should return prices in the same precision, including the denominator
+      // price feed if it exists.
+      if (
+        medianizerPriceFeed.getPriceFeedDecimals() !== tokenPriceFeed.getPriceFeedDecimals() &&
+        denominatorPriceFeed &&
+        medianizerPriceFeed.getPriceFeedDecimals() !== denominatorPriceFeed.getPriceFeedDecimals()
+      ) {
+        throw new Error("Pricefeed decimals are not uniform");
+      }
+
+      if (!medianizerPriceFeed || !tokenPriceFeed) {
+        throw new Error("Price feed config is invalid");
+      }
+
+      const [priceIdentifier, collateralTokenAddress, syntheticTokenAddress] = await Promise.all([
+        financialContract.methods.priceIdentifier().call(),
+        financialContract.methods.collateralCurrency().call(),
+        financialContract.methods.tokenCurrency().call()
+      ]);
+      const collateralToken = new web3.eth.Contract(getAbi("ExpandedERC20"), collateralTokenAddress);
+      const syntheticToken = new web3.eth.Contract(getAbi("ExpandedERC20"), syntheticTokenAddress);
+
+      const [collateralSymbol, syntheticSymbol, collateralDecimals, syntheticDecimals] = await Promise.all([
+        collateralToken.methods.symbol().call(),
+        syntheticToken.methods.symbol().call(),
+        collateralToken.methods.decimals().call(),
+        syntheticToken.methods.decimals().call()
+      ]);
+      // Generate Financial Contract properties to inform monitor modules of important info like token symbols and price identifier.
+      const financialContractProps = {
+        collateralSymbol,
+        syntheticSymbol,
+        collateralDecimals: Number(collateralDecimals),
+        syntheticDecimals: Number(syntheticDecimals),
+        priceFeedDecimals,
+        priceIdentifier: hexToUtf8(priceIdentifier),
+        networkId
+      };
+
+      // 1. Contract state monitor.
+      const financialContractEventClient = new FinancialContractEventClient(
+        logger,
+        getAbi(monitorConfig.contractType, monitorConfig.contractVersion),
+        web3,
+        financialContractAddress,
+        eventsFromBlockNumber,
+        endingBlock,
+        monitorConfig.contractType
+      );
+
+      const contractMonitor = new ContractMonitor({
+        logger,
+        financialContractEventClient,
+        priceFeed: medianizerPriceFeed,
+        monitorConfig,
+        financialContractProps,
+        voting
+      });
+
+      // 2. Balance monitor to inform if monitored addresses drop below critical thresholds.
+      const tokenBalanceClient = new TokenBalanceClient(
+        logger,
+        getAbi("ExpandedERC20"),
+        web3,
+        collateralTokenAddress,
+        syntheticTokenAddress
+      );
+
+      const balanceMonitor = new BalanceMonitor({
+        logger,
+        tokenBalanceClient,
+        monitorConfig,
+        financialContractProps
+      });
+
+      // 3. Collateralization Ratio monitor.
+      const financialContractClient = new FinancialContractClient(
+        logger,
+        getAbi(monitorConfig.contractType, monitorConfig.contractVersion),
+        web3,
+        financialContractAddress,
+        collateralDecimals,
+        syntheticDecimals,
+        medianizerPriceFeed.getPriceFeedDecimals(),
+        monitorConfig.contractType
+      );
+
+      const crMonitor = new CRMonitor({
+        logger,
+        financialContractClient,
+        priceFeed: medianizerPriceFeed,
+        monitorConfig,
+        financialContractProps
+      });
+
+      // 4. Synthetic Peg Monitor.
+      const syntheticPegMonitor = new SyntheticPegMonitor({
+        logger,
+        web3,
+        uniswapPriceFeed: tokenPriceFeed,
+        medianizerPriceFeed,
+        denominatorPriceFeed,
+        monitorConfig,
+        financialContractProps
+      });
+
+      logger.debug({
+        at: "Monitor#index",
+        message: "Monitor initialized",
+        collateralDecimals: Number(collateralDecimals),
+        syntheticDecimals: Number(syntheticDecimals),
+        priceFeedDecimals: Number(medianizerPriceFeed.getPriceFeedDecimals()),
+        tokenPriceFeedConfig,
+        medianizerPriceFeedConfig,
+        monitorConfig
+      });
+
+      // Clients must be updated before monitors can run:
+      populateMonitorRunnerHelpers.push(() => {
+        monitorRunners.push(
+          Promise.all([
+            financialContractClient.update(),
+            financialContractEventClient.update(),
+            tokenBalanceClient.update(),
+            medianizerPriceFeed.update(),
+            tokenPriceFeed.update(),
+            denominatorPriceFeed && denominatorPriceFeed.update()
+          ]).then(async () => {
+            await Promise.all([
+              // 1. Contract monitor. Check for liquidations, disputes, dispute settlement and sponsor events.
+              contractMonitor.checkForNewLiquidations(),
+              contractMonitor.checkForNewDisputeEvents(),
+              contractMonitor.checkForNewDisputeSettlementEvents(),
+              contractMonitor.checkForNewSponsors(),
+              contractMonitor.checkForNewFundingRateUpdatedEvents(),
+              // 2.  Wallet Balance monitor. Check if the bot balances have moved past thresholds.
+              balanceMonitor.checkBotBalances(),
+              // 3.  Position Collateralization Ratio monitor. Check if monitored wallets are still safely above CRs.
+              crMonitor.checkWalletCrRatio(),
+              // 4. Synthetic peg monitor. Check for peg deviation, peg volatility and synthetic volatility.
+              syntheticPegMonitor.checkPriceDeviation(),
+              syntheticPegMonitor.checkPegVolatility(),
+              syntheticPegMonitor.checkSyntheticVolatility()
+            ]);
+          })
+        );
+      });
     }
 
-    // Setup contract instances. NOTE that getAddress("Voting", networkId) will resolve to null in tests.
-    const emp = new web3.eth.Contract(getAbi("ExpiringMultiParty"), empAddress);
-    // Setup contract instances.
-    const voting = new web3.eth.Contract(getAbi("Voting"), getAddress("Voting", networkId));
+    /** *************************************
+     *
+     * OptimisticOracle Contract Runner
+     *
+     ***************************************/
+    if (optimisticOracleAddress) {
+      const optimisticOracleContractEventClient = new OptimisticOracleEventClient(
+        logger,
+        getAbi("OptimisticOracle"),
+        web3,
+        optimisticOracleAddress,
+        eventsFromBlockNumber,
+        endingBlock
+      );
 
-    const [priceIdentifier, collateralTokenAddress, syntheticTokenAddress] = await Promise.all([
-      emp.methods.priceIdentifier().call(),
-      emp.methods.collateralCurrency().call(),
-      emp.methods.tokenCurrency().call()
-    ]);
-    const collateralToken = new web3.eth.Contract(getAbi("ExpandedERC20"), collateralTokenAddress);
-    const syntheticToken = new web3.eth.Contract(getAbi("ExpandedERC20"), syntheticTokenAddress);
+      const contractProps = {
+        networkId
+      };
+      const contractMonitor = new OptimisticOracleContractMonitor({
+        logger,
+        optimisticOracleContractEventClient,
+        monitorConfig,
+        contractProps
+      });
 
-    const [
-      collateralCurrencySymbol,
-      syntheticCurrencySymbol,
-      collateralCurrencyDecimals,
-      syntheticCurrencyDecimals
-    ] = await Promise.all([
-      collateralToken.methods.symbol().call(),
-      syntheticToken.methods.symbol().call(),
-      collateralToken.methods.decimals().call(),
-      syntheticToken.methods.decimals().call()
-    ]);
-
-    // Generate EMP properties to inform monitor modules of important info like token symbols and price identifier.
-    const empProps = {
-      collateralCurrencySymbol,
-      syntheticCurrencySymbol,
-      collateralCurrencyDecimals,
-      syntheticCurrencyDecimals,
-      priceIdentifier: hexToUtf8(priceIdentifier),
-      networkId
-    };
-
-    // 1. Contract state monitor.
-    // Start the event client by looking from the provided `startingBlock` number to the provided `endingBlock` number.
-    // If param are sets to null then use the `latest` block number for the `eventsFromBlockNumber` and leave the
-    // `endingBlock` as null in the client constructor. The client will then query up until the `latest` block on every
-    // loop and update this variable accordingly on each iteration.
-    const eventsFromBlockNumber = startingBlock ? startingBlock : latestBlock.number;
-
-    const empEventClient = new ExpiringMultiPartyEventClient(
-      logger,
-      getAbi("ExpiringMultiParty"),
-      web3,
-      empAddress,
-      eventsFromBlockNumber,
-      endingBlock
-    );
-
-    const contractMonitor = new ContractMonitor({
-      logger,
-      expiringMultiPartyEventClient: empEventClient,
-      priceFeed: medianizerPriceFeed,
-      config: monitorConfig,
-      empProps,
-      voting
-    });
-
-    // 2. Balance monitor to inform if monitored addresses drop below critical thresholds.
-    const tokenBalanceClient = new TokenBalanceClient(
-      logger,
-      getAbi("ExpandedERC20"),
-      web3,
-      collateralTokenAddress,
-      syntheticTokenAddress
-    );
-
-    const balanceMonitor = new BalanceMonitor({
-      logger,
-      tokenBalanceClient,
-      config: monitorConfig,
-      empProps
-    });
-
-    // 3. Collateralization Ratio monitor.
-    const empClient = new ExpiringMultiPartyClient(logger, getAbi("ExpiringMultiParty"), web3, empAddress);
-
-    const crMonitor = new CRMonitor({
-      logger,
-      expiringMultiPartyClient: empClient,
-      priceFeed: medianizerPriceFeed,
-      config: monitorConfig,
-      empProps
-    });
-
-    // 4. Synthetic Peg Monitor.
-    const syntheticPegMonitor = new SyntheticPegMonitor({
-      logger,
-      web3,
-      uniswapPriceFeed: tokenPriceFeed,
-      medianizerPriceFeed,
-      config: monitorConfig,
-      empProps
-    });
+      // Clients must be updated before monitors can run:
+      populateMonitorRunnerHelpers.push(() => {
+        monitorRunners.push(
+          Promise.all([optimisticOracleContractEventClient.update()]).then(async () => {
+            await Promise.all([
+              contractMonitor.checkForRequests(),
+              contractMonitor.checkForProposals(),
+              contractMonitor.checkForDisputes(),
+              contractMonitor.checkForSettlements()
+            ]);
+          })
+        );
+      });
+    }
 
     // Create a execution loop that will run indefinitely (or yield early if in serverless mode)
     for (;;) {
       await retry(
-        async () => {
-          // Update all client and price feeds.
-          await Promise.all([
-            empClient.update(),
-            empEventClient.update(),
-            tokenBalanceClient.update(),
-            medianizerPriceFeed.update(),
-            tokenPriceFeed.update()
-          ]);
-
-          // Run all queries within the monitor bots modules.
-          await Promise.all([
-            // 1. Contract monitor. Check for liquidations, disputes, dispute settlement and sponsor events.
-            contractMonitor.checkForNewLiquidations(),
-            contractMonitor.checkForNewDisputeEvents(),
-            contractMonitor.checkForNewDisputeSettlementEvents(),
-            contractMonitor.checkForNewSponsors(),
-            // 2.  Wallet Balance monitor. Check if the bot ballances have moved past thresholds.
-            balanceMonitor.checkBotBalances(),
-            // 3.  Position Collateralization Ratio monitor. Check if monitored wallets are still safely above CRs.
-            crMonitor.checkWalletCrRatio(),
-            // 4. Synthetic peg monitor. Check for peg deviation, peg volatility and synthetic volatility.
-            syntheticPegMonitor.checkPriceDeviation(),
-            syntheticPegMonitor.checkPegVolatility(),
-            syntheticPegMonitor.checkSyntheticVolatility()
-          ]);
+        async function() {
+          // First populate monitorRunners array with promises to fulfill in parallel:
+          populateMonitorRunnerHelpers.forEach(helperFunc => {
+            helperFunc();
+          });
+          // Now that monitor runners is populated, run them in parallel.
+          await Promise.all(monitorRunners);
         },
         {
           retries: errorRetries,
@@ -237,6 +380,7 @@ async function run({
           message: "End of serverless execution loop - terminating process"
         });
         await waitForLogger(logger);
+        await delay(2); // waitForLogger does not always work 100% correctly in serverless. add a delay to ensure logs are captured upstream.
         break;
       }
       logger.debug({
@@ -252,26 +396,28 @@ async function run({
 }
 async function Poll(callback) {
   try {
-    if (!process.env.EMP_ADDRESS) {
+    if (!process.env.OPTIMISTIC_ORACLE_ADDRESS && !process.env.EMP_ADDRESS && !process.env.FINANCIAL_CONTRACT_ADDRESS) {
       throw new Error(
-        "Bad environment variables! Specify an `EMP_ADDRESS` for the location of the expiring Multi Party."
+        "Bad environment variables! Specify an OPTIMISTIC_ORACLE_ADDRESS, EMP_ADDRESS or FINANCIAL_CONTRACT_ADDRESS for the location of the contract the bot is expected to interact with."
       );
     }
 
     // Deprecate UNISWAP_PRICE_FEED_CONFIG to favor TOKEN_PRICE_FEED_CONFIG, leaving in for compatibility.
     // If nothing defined, it will default to uniswap within createPriceFeed
     const tokenPriceFeedConfigEnv = process.env.TOKEN_PRICE_FEED_CONFIG || process.env.UNISWAP_PRICE_FEED_CONFIG;
+    const denominatorPriceFeedConfigEnv = process.env.TOKEN_DENOMINATOR_PRICE_FEED_CONFIG;
 
     // This object is spread when calling the `run` function below. It relies on the object enumeration order and must
     // match the order of parameters defined in the`run` function.
     const executionParameters = {
-      empAddress: process.env.EMP_ADDRESS,
+      optimisticOracleAddress: process.env.OPTIMISTIC_ORACLE_ADDRESS,
+      financialContractAddress: process.env.EMP_ADDRESS || process.env.FINANCIAL_CONTRACT_ADDRESS,
       // Default to 1 minute delay. If set to 0 in env variables then the script will exit after full execution.
       pollingDelay: process.env.POLLING_DELAY ? Number(process.env.POLLING_DELAY) : 60,
-      // Default to 5 re-tries on error within the execution loop.
-      errorRetries: process.env.ERROR_RETRIES ? Number(process.env.ERROR_RETRIES) : 5,
-      // Default to 10 seconds in between error re-tries.
-      errorRetriesTimeout: process.env.ERROR_RETRIES__TIMEOUT ? Number(process.env.ERROR_RETRIES__TIMEOUT) : 10,
+      // Default to 3 re-tries on error within the execution loop.
+      errorRetries: process.env.ERROR_RETRIES ? Number(process.env.ERROR_RETRIES) : 3,
+      // Default to 1 seconds in between error re-tries.
+      errorRetriesTimeout: process.env.ERROR_RETRIES_TIMEOUT ? Number(process.env.ERROR_RETRIES_TIMEOUT) : 1,
       // Block number to search for events from. If set, acts to offset the search to ignore events in the past. If not
       // set then default to null which indicates that the bot should start at the current block number.
       startingBlock: process.env.STARTING_BLOCK_NUMBER,
@@ -303,9 +449,13 @@ async function Poll(callback) {
       //       "collateralThreshold":"error",                // BalanceMonitor collateral balance threshold alert.
       //       "ethThreshold":"error",                       // BalanceMonitor ETH balance threshold alert.
       //       "newPositionCreated":"debug"                  // ContractMonitor new position created.
+      //       "proposedPrice":"info"                        // OptimisticOracleContractMonitor price proposed
+      //       "disputedPrice":"info"                        // OptimisticOracleContractMonitor price disputed
+      //       "settledPrice":"warn"                         // OptimisticOracleContractMonitor price settled
+      //       "requestedPrice":"info"                       // OptimisticOracleContractMonitor price requested
       //   }
       // }
-      monitorConfig: process.env.MONITOR_CONFIG ? JSON.parse(process.env.MONITOR_CONFIG) : null,
+      monitorConfig: process.env.MONITOR_CONFIG ? JSON.parse(process.env.MONITOR_CONFIG) : {},
       // Read price feed configuration from an environment variable. Uniswap price feed contains information about the
       // uniswap market. EG: {"type":"uniswap","twapLength":2,"lookback":7200,"invertPrice":true "uniswapAddress":"0x1234"}
       // Requires the address of the balancer pool where price is available.
@@ -314,6 +464,7 @@ async function Poll(callback) {
       // Medianizer price feed averages over a set of different sources to get an average. Config defines the exchanges
       // to use. EG: {"type":"medianizer","pair":"ethbtc", "invertPrice":true, "lookback":7200,"minTimeBetweenUpdates":60,"medianizedFeeds":[
       // {"type":"cryptowatch","exchange":"coinbase-pro"},{"type":"cryptowatch","exchange":"binance"}]}
+      denominatorPriceFeedConfig: denominatorPriceFeedConfigEnv ? JSON.parse(denominatorPriceFeedConfigEnv) : null,
       medianizerPriceFeedConfig: process.env.MEDIANIZER_PRICE_FEED_CONFIG
         ? JSON.parse(process.env.MEDIANIZER_PRICE_FEED_CONFIG)
         : null

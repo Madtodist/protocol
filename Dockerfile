@@ -19,7 +19,7 @@
 # To `docker run` with your locally built image, replace `umaprotocol/protocol` with <username>/<imagename>.
 
 # Fix node version due to high potential for incompatibilities.
-FROM node:12
+FROM node:lts
 
 # All source code and execution happens from the protocol directory.
 WORKDIR /protocol
@@ -33,8 +33,8 @@ RUN apt-get install -y libudev-dev libusb-1.0-0-dev jq yarn
 RUN npx lerna bootstrap
 
 # Clean and run all package build steps, but exclude dapps (to save time).
-RUN yarn lerna run clean --ignore '*/*dapp*'
-RUN yarn lerna run build --ignore '*/*dapp*'
+RUN yarn clean
+RUN yarn qbuild
 
 # Command to run any command provided by the COMMAND env variable.
 ENTRYPOINT ["/bin/bash", "scripts/runCommand.sh"]
